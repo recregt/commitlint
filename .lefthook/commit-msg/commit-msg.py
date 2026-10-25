@@ -42,6 +42,22 @@ IMPERATIVE_BASE_FORMS = {
 
 EXEMPT_PREFIXES = ("Merge ", "Revert ", "fixup! ", "squash! ")
 
+LOCKFILES = frozenset(
+    {
+        "Cargo.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "flake.lock",
+        "go.sum",
+        "go.work.sum",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "uv.lock",
+        "yarn.lock",
+    }
+)
+
 
 def fail(context_line: str, reason: str, label: str = "Invalid commit message:") -> NoReturn:
     print(label, file=sys.stderr)
@@ -76,35 +92,60 @@ def repo_root() -> Path:
     return Path(out.stdout.strip())
 
 
-def valid_scopes(root: Path) -> list:
-    scopes = []
-    for entry in root.iterdir():
-        if entry.name in (".git", "target"):
+def tracked_files(root: Path) -> list:
+    out = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+    return [path for path in out.stdout.split("\0") if path]
+
+
+def layout(root: Path):
+    names = set()
+    inside = {}
+    for path in tracked_files(root):
+        first, sep, rest = path.partition("/")
+        names.add(first)
+        if not sep:
             continue
-        scopes.append(entry.name)
-    crates_dir = root / "crates"
-    if crates_dir.is_dir():
-        for entry in crates_dir.iterdir():
-            if entry.is_dir():
-                scopes.append(entry.name)
-    return sorted(set(scopes))
+        entry = inside.setdefault(first, {"has_files": False, "units": set()})
+        unit, nested, _ = rest.partition("/")
+        if nested:
+            entry["units"].add(unit)
+        else:
+            entry["has_files"] = True
+    groups = {
+        name: entry["units"]
+        for name, entry in inside.items()
+        if not entry["has_files"] and not name.startswith(".")
+    }
+    return names, groups
 
 
-def touched_dirs(changed_files):
-    filtered = [path for path in changed_files if path != "Cargo.lock"]
+def valid_scopes(names, groups) -> list:
+    scopes = set(names)
+    for units in groups.values():
+        scopes |= units
+    return sorted(scopes)
+
+
+def touched_areas(changed_files, groups):
+    filtered = [path for path in changed_files if path not in LOCKFILES]
     if not filtered:
         filtered = changed_files
 
-    touched = set()
-    all_crate_scoped = True
+    areas = set()
     for path in filtered:
         first, _, rest = path.partition("/")
-        if first == "crates" and "/" in rest:
-            touched.add(rest.split("/", 1)[0])
+        if first in groups and "/" in rest:
+            areas.add((first, rest.split("/", 1)[0]))
         else:
-            touched.add(first)
-            all_crate_scoped = False
-    return sorted(touched), all_crate_scoped
+            areas.add((None, first))
+    return areas
 
 
 def changed_files_for(sha):
@@ -154,7 +195,8 @@ def main() -> None:
                 label="Invalid commit message body:",
             )
 
-    scopes = valid_scopes(repo_root())
+    names, groups = layout(repo_root())
+    scopes = valid_scopes(names, groups)
     types_re = "|".join(TYPES)
     scope_re = "|".join(re.escape(s) for s in scopes) if scopes else "(?!)"
     scope_part = rf"(?:\((?P<scope>{scope_re})\))?"
@@ -189,7 +231,9 @@ def main() -> None:
     if not changed_files:
         return
 
-    touched, all_crate_scoped = touched_dirs(changed_files)
+    areas = touched_areas(changed_files, groups)
+    touched = sorted(name for _, name in areas)
+    touched_groups = {group for group, _ in areas}
     files_note = f"  files touched: {' '.join(changed_files)}"
 
     if len(touched) == 1:
@@ -203,14 +247,16 @@ def main() -> None:
             fail(
                 header,
                 f"This commit only touches '.github', use type 'ci' (not "
-                f"'{commit_type}') so CHANGELOG.md skips it.\n{files_note}",
+                f"'{commit_type}') so the changelog skips it.\n{files_note}",
             )
-    elif all_crate_scoped:
-        if written_scope and written_scope != "crates":
+    elif len(touched_groups) == 1 and None not in touched_groups:
+        group = next(iter(touched_groups))
+        if written_scope and written_scope != group:
             fail(
                 header,
-                f"This commit touches multiple crates ({' '.join(touched)}); "
-                f"use scope 'crates' or omit the scope.\n{files_note}",
+                f"This commit touches multiple units of '{group}' "
+                f"({' '.join(touched)}); use scope '{group}' or omit the "
+                f"scope.\n{files_note}",
             )
     else:
         if written_scope:
