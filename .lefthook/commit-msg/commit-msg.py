@@ -150,13 +150,14 @@ def touched_areas(changed_files, groups):
 
 def changed_files_for(sha):
     if sha:
-        cmd = ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha]
+        cmd = ["git", "diff-tree", "--root", "--no-commit-id", "-r", sha]
     else:
-        cmd = ["git", "diff", "--cached", "--name-only"]
+        cmd = ["git", "diff", "--cached"]
+    cmd += ["--name-only", "--no-renames", "-z"]
     out = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", check=True
     )
-    return [line for line in out.stdout.splitlines() if line]
+    return [path for path in out.stdout.split("\0") if path]
 
 
 def main() -> None:
